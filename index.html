@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
+<meta name="referrer" content="no-referrer">
+<title>Private site</title>
+<style>
+  :root { color-scheme: light dark; }
+  html, body { margin: 0; min-height: 100%; font: 16px/1.45 system-ui, sans-serif; }
+  body { display: flex; align-items: center; justify-content: center; padding: 24px; background: #f4f4f5; color: #18181b; }
+  form { width: 100%; max-width: 22rem; background: #fff; border: 1px solid #e4e4e7; border-radius: 12px; padding: 1.4rem 1.3rem 1.2rem; }
+  h1 { font-size: 1.15rem; font-weight: 650; margin: 0 0 .4rem; }
+  p { margin: 0 0 1rem; color: #52525b; }
+  input[type=password] { width: 100%; box-sizing: border-box; font-size: 16px; padding: .65rem .7rem; border: 1px solid #d4d4d8; border-radius: 8px; margin: 0 0 .8rem; }
+  label { display: flex; gap: .5rem; align-items: flex-start; font-size: .92rem; color: #3f3f46; margin: 0 0 1rem; }
+  button { width: 100%; font: inherit; font-weight: 600; padding: .7rem; border: 0; border-radius: 8px; background: #18181b; color: #fff; cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  .err { color: #b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #09090b; color: #fafafa; }
+    form { background: #18181b; border-color: #27272a; }
+    p { color: #a1a1aa; }
+    input[type=password] { background: #09090b; color: #fafafa; border-color: #3f3f46; }
+    label { color: #d4d4d8; }
+    button { background: #fafafa; color: #18181b; }
+    .err { color: #fca5a5; }
+  }
+</style>
+</head>
+<body>
+<form id="f" autocomplete="on">
+  <h1>This site is private</h1>
+  <p id="s">Enter the password to continue.</p>
+  <input id="p" type="password" name="password" autocomplete="current-password" required autofocus>
+  <label><input id="r" type="checkbox"> Remember on this device</label>
+  <button type="submit" id="b">Continue</button>
+</form>
+<script>
+(function () {
+  var DB = "k1", STORE = "k";
+  var statusEl = document.getElementById("s");
+  var form = document.getElementById("f");
+  var passEl = document.getElementById("p");
+  var remEl = document.getElementById("r");
+  var btn = document.getElementById("b");
+  var busy = false;
+
+  function setStatus(msg, err) {
+    statusEl.textContent = msg;
+    statusEl.className = err ? "err" : "";
+  }
+  function fail() {
+    busy = false;
+    btn.disabled = false;
+    passEl.value = "";
+    passEl.disabled = false;
+    remEl.disabled = false;
+    setStatus("Could not unlock.", true);
+  }
+  function loadFail() {
+    busy = false;
+    btn.disabled = false;
+    passEl.disabled = false;
+    remEl.disabled = false;
+    setStatus("Could not load.", true);
+  }
+
+  function idbOpen() {
+    return new Promise(function (resolve, reject) {
+      var r = indexedDB.open(DB, 1);
+      r.onupgradeneeded = function () {
+        var db = r.result;
+        if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+      };
+      r.onsuccess = function () { resolve(r.result); };
+      r.onerror = function () { reject(r.error); };
+    });
+  }
+  function idbGet(key) {
+    return idbOpen().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(STORE, "readonly");
+        var q = tx.objectStore(STORE).get(key);
+        q.onsuccess = function () { resolve(q.result || null); };
+        q.onerror = function () { reject(q.error); };
+      });
+    });
+  }
+  function idbSet(key, val) {
+    return idbOpen().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(STORE, "readwrite");
+        tx.objectStore(STORE).put(val, key);
+        tx.oncomplete = function () { resolve(); };
+        tx.onerror = function () { reject(tx.error); };
+      });
+    });
+  }
+  function idbDel(key) {
+    return idbOpen().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction(STORE, "readwrite");
+        tx.objectStore(STORE).delete(key);
+        tx.oncomplete = function () { resolve(); };
+        tx.onerror = function () { reject(tx.error); };
+      });
+    }).catch(function () {});
+  }
+
+  function b64(s) {
+    var bin = atob(s);
+    var u = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    return u;
+  }
+
+  function deriveKey(pass, salt, iter) {
+    return crypto.subtle.importKey("raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveKey"]).then(function (mat) {
+      return crypto.subtle.deriveKey(
+        { name: "PBKDF2", salt: salt, iterations: iter, hash: "SHA-256" },
+        mat,
+        { name: "AES-GCM", length: 256 },
+        true,
+        ["decrypt"]
+      );
+    });
+  }
+
+  function decryptChunk(key, iv, blob) {
+    if (blob.byteLength < 16) return Promise.reject(new Error("x"));
+    return crypto.subtle.decrypt({ name: "AES-GCM", iv: iv }, key, blob);
+  }
+
+  function gunzip(buf) {
+    var ds = new DecompressionStream("gzip");
+    var stream = new Blob([buf]).stream().pipeThrough(ds);
+    return new Response(stream).arrayBuffer();
+  }
+
+  function u32(view, off) { return view.getUint32(off, true); }
+
+  function unpack(buf) {
+    var view = new DataView(buf);
+    var magic = new Uint8Array(buf, 0, 8);
+    var expect = [83, 84, 71, 86, 76, 84, 48, 49];
+    for (var i = 0; i < 8; i++) if (magic[i] !== expect[i]) throw new Error("x");
+    if (u32(view, 8) !== 1) throw new Error("x");
+    var count = u32(view, 12);
+    var off = 16;
+    var dec = new TextDecoder();
+    var files = [];
+    for (var n = 0; n < count; n++) {
+      var pathLen = u32(view, off); off += 4;
+      var mimeLen = u32(view, off); off += 4;
+      var dataLen = u32(view, off); off += 4;
+      var rel = dec.decode(new Uint8Array(buf, off, pathLen)); off += pathLen;
+      var mime = dec.decode(new Uint8Array(buf, off, mimeLen)); off += mimeLen;
+      var data = buf.slice(off, off + dataLen); off += dataLen;
+      files.push({ rel: rel, mime: mime, data: data });
+    }
+    return files;
+  }
+
+  function scopeUrl(rel) {
+    return new URL(rel, new URL("./", location.href));
+  }
+
+  async function mount(files, cacheName) {
+    var cache = await caches.open(cacheName);
+    var existing = await cache.keys();
+    await Promise.all(existing.map(function (k) { return cache.delete(k); }));
+    var puts = [];
+    for (var i = 0; i < files.length; i++) {
+      var f = files[i];
+      var headers = { "Content-Type": f.mime, "Cache-Control": "no-store", "Accept-Ranges": "bytes" };
+      puts.push(cache.put(scopeUrl(f.rel), new Response(f.data, { headers: headers })));
+    }
+    await Promise.all(puts);
+  }
+
+  function postSW(msg) {
+    return new Promise(function (resolve, reject) {
+      var ctl = navigator.serviceWorker && navigator.serviceWorker.controller;
+      if (!ctl) { reject(new Error("x")); return; }
+      var ch = new MessageChannel();
+      var t = setTimeout(function () { reject(new Error("x")); }, 4000);
+      ch.port1.onmessage = function () { clearTimeout(t); resolve(); };
+      ctl.postMessage(msg, [ch.port2]);
+    });
+  }
+
+  async function ensureWorker() {
+    if (!("serviceWorker" in navigator)) throw new Error("x");
+    var reg = await navigator.serviceWorker.register("./sw.js", { scope: "./", updateViaCache: "none" });
+    await navigator.serviceWorker.ready;
+    if (reg.waiting) reg.waiting.postMessage({ t: "skip" });
+    if (!navigator.serviceWorker.controller) {
+      await new Promise(function (resolve) {
+        var done = false;
+        function finish() { if (done) return; done = true; resolve(); }
+        navigator.serviceWorker.addEventListener("controllerchange", finish, { once: true });
+        setTimeout(finish, 2500);
+      });
+    }
+    if (!navigator.serviceWorker.controller) throw new Error("x");
+  }
+
+  async function goLiveAndReload(id) {
+    sessionStorage.setItem("u", id);
+    await ensureWorker();
+    await postSW({ t: "unlock" });
+    location.reload();
+  }
+
+  async function dropVaults() {
+    var names = await caches.keys();
+    await Promise.all(names.filter(function (n) { return n.indexOf("v-") === 0; }).map(function (n) { return caches.delete(n); }));
+  }
+
+  async function loadManifest() {
+    var res = await fetch("./m.json", { cache: "no-store" });
+    if (!res.ok) throw new Error("load");
+    return res.json();
+  }
+
+  async function unlockWithKey(key, man, remember) {
+    var parts = [];
+    for (var i = 0; i < man.chunks.length; i++) {
+      var ch = man.chunks[i];
+      var res = await fetch("./" + ch.u, { cache: "no-store" });
+      if (!res.ok) throw new Error("load");
+      var blob = await res.arrayBuffer();
+      var plain = await decryptChunk(key, b64(ch.iv), blob);
+      parts.push(plain);
+    }
+    var total = 0;
+    for (var j = 0; j < parts.length; j++) total += parts[j].byteLength;
+    var gz = new Uint8Array(total);
+    var o = 0;
+    for (var k = 0; k < parts.length; k++) { gz.set(new Uint8Array(parts[k]), o); o += parts[k].byteLength; }
+    var packed = await gunzip(gz);
+    var files = unpack(packed);
+    var cacheName = "v-" + man.id;
+    await mount(files, cacheName);
+    if (remember) {
+      try {
+        var raw = await crypto.subtle.exportKey("raw", key);
+        await idbSet("cur", { id: man.id, k: raw });
+      } catch (e) {}
+    } else {
+      try { await idbDel("cur"); } catch (e) {}
+    }
+    await goLiveAndReload(man.id);
+  }
+
+  async function start(pass, remember) {
+    var man;
+    try { man = await loadManifest(); }
+    catch (e) { loadFail(); return; }
+    var key;
+    try { key = await deriveKey(pass, b64(man.salt), man.iter); }
+    catch (e) { fail(); return; }
+    try { await unlockWithKey(key, man, remember); }
+    catch (e) {
+      if (String(e && e.message) === "load") loadFail();
+      else fail();
+    }
+  }
+
+  async function tryRemembered() {
+    var man;
+    try { man = await loadManifest(); }
+    catch (e) { return false; }
+    var rec;
+    try { rec = await idbGet("cur"); }
+    catch (e) { return false; }
+    if (!rec || rec.id !== man.id || !rec.k) return false;
+    setStatus("Unlocking…");
+    btn.disabled = true;
+    passEl.disabled = true;
+    remEl.disabled = true;
+    busy = true;
+    try {
+      var key = await crypto.subtle.importKey("raw", rec.k, { name: "AES-GCM" }, true, ["decrypt"]);
+      await unlockWithKey(key, man, false);
+      return true;
+    } catch (e) {
+      await idbDel("cur");
+      busy = false;
+      btn.disabled = false;
+      passEl.disabled = false;
+      remEl.disabled = false;
+      setStatus("Enter the password to continue.");
+      return false;
+    }
+  }
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js", { scope: "./", updateViaCache: "none" }).catch(function () {});
+  }
+
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    if (busy) return;
+    var pass = String(passEl.value || "").trim();
+    if (!pass) return;
+    busy = true;
+    btn.disabled = true;
+    passEl.disabled = true;
+    remEl.disabled = true;
+    setStatus("Unlocking…");
+    start(pass, remEl.checked);
+  });
+
+  async function boot() {
+    var man;
+    try { man = await loadManifest(); }
+    catch (e) { return; }
+    var sid = null;
+    try { sid = sessionStorage.getItem("u"); } catch (e) {}
+    if (sid === man.id) {
+      try {
+        var cache = await caches.open("v-" + man.id);
+        var hit = await cache.match(scopeUrl("index.html"));
+        if (hit) {
+          setStatus("Unlocking…");
+          btn.disabled = true;
+          passEl.disabled = true;
+          remEl.disabled = true;
+          busy = true;
+          await goLiveAndReload(man.id);
+          return;
+        }
+      } catch (e) {}
+    }
+    var rec = null;
+    try { rec = await idbGet("cur"); } catch (e) {}
+    if (!(rec && rec.id === man.id && rec.k)) {
+      try { await dropVaults(); } catch (e) {}
+    }
+    await tryRemembered();
+  }
+  boot();
+})();
+</script>
+</body>
+</html>
