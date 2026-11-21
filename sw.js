@@ -12,9 +12,25 @@ self.addEventListener("message", function (e) {
   }
   if (d.t === "lock") {
     live = false;
+    caches.delete(LIVE_CACHE).catch(function () {});
     if (e.ports && e.ports[0]) e.ports[0].postMessage({ ok: 1 });
   }
 });
+
+// The browser stops an idle worker at any time (about 30 s on Chrome, sooner on iOS) and the
+// in-memory "live" flag is lost. Remember which page clients were served the unlocked game so their
+// later image / audio / module requests keep working after a restart. Client ids die with the tab.
+var LIVE_CACHE = "sw-live";
+var seenClients = {};
+function liveKey(id) { return new URL("__live/" + encodeURIComponent(id), self.registration.scope); }
+async function rememberClient(id) {
+  if (!id) return;
+  try { var c = await caches.open(LIVE_CACHE); await c.put(liveKey(id), new Response("1")); } catch (e) {}
+}
+async function isLiveClient(id) {
+  if (!id) return false;
+  try { var c = await caches.open(LIVE_CACHE); return !!(await c.match(liveKey(id))); } catch (e) { return false; }
+}
 
 function scopePath() {
   return new URL(self.registration.scope).pathname;
@@ -55,8 +71,8 @@ function rangeResponse(req, res) {
   });
 }
 
-async function fromVault(req, rel) {
-  if (!live) return null;
+async function fromVault(req, rel, ok) {
+  if (!live && !ok) return null;
   var names = await caches.keys();
   var latest = names.filter(function (n) { return n.indexOf("v-") === 0; }).sort().reverse();
   for (var i = 0; i < latest.length; i++) {
@@ -84,11 +100,13 @@ self.addEventListener("fetch", function (event) {
   if (rel == null) return;
   if (isReserved(rel)) return;
   event.respondWith((async function () {
-    var hit = await fromVault(req, rel);
-    if (hit) return hit;
+    var ok = live || (req.mode !== "navigate" && await isLiveClient(event.clientId));
+    if (live && event.clientId && !seenClients[event.clientId]) { seenClients[event.clientId] = 1; await rememberClient(event.clientId); } // no resultingClientId (older Safari)
+    var hit = await fromVault(req, rel, ok);
+    if (hit) { if (req.mode === "navigate") await rememberClient(event.resultingClientId); return hit; }
     if (req.mode === "navigate") {
-      var page = await fromVault(req, "index.html");
-      if (page) return page;
+      var page = await fromVault(req, "index.html", ok);
+      if (page) { await rememberClient(event.resultingClientId); return page; }
     }
     return fetch(req);
   })());
